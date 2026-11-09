@@ -228,7 +228,25 @@ async function retryCheck(page) {
   await page.waitForFunction(() => document.querySelector("video")?.currentTime > 1);
   assert.equal(await page.evaluate(() => window.playerSeekFixture.playCalls), 2, "Retry must obtain fresh playback information");
   assert.equal(await page.getByText("视频暂时无法加载", { exact: true }).count(), 0);
-  return { playback_requests: 2, recovered_from_api_failure: true };
+  await page.waitForFunction(() => {
+    const video = document.querySelector("video");
+    return video.currentTime > 2 && video.buffered.length && video.buffered.end(0) > 8;
+  });
+  await page.evaluate(() => { window.keptVideo = document.querySelector("video"); window.keptVideo.pause(); });
+  await page.route("**/seg?*", route => route.abort());
+  await page.evaluate(() => window.playerSeekFixture.failPlayback());
+  await page.getByText("视频暂时无法加载", { exact: true }).waitFor();
+  await page.getByRole("button", { name: "关闭", exact: true }).click();
+  await page.getByText("视频暂时无法加载", { exact: true }).waitFor({ state: "hidden" });
+  await page.evaluate(() => window.playerSeekFixture.failPlayback());
+  await page.evaluate(() => new Promise(resolve => requestAnimationFrame(resolve)));
+  assert.equal(await page.getByText("视频暂时无法加载", { exact: true }).count(), 0, "Dismissed errors must not immediately reopen");
+  assert(await page.evaluate(() => document.querySelector("video") === window.keptVideo), "Close must preserve the player");
+  assert(await page.locator("video").evaluate(video => video.buffered.length > 0 && video.buffered.start(0) <= 1 && video.buffered.end(0) > 3), "Close must retain buffered content");
+  await page.locator("video").evaluate(video => { video.currentTime = 1; return video.play(); });
+  await page.waitForFunction(() => document.querySelector("video").currentTime > 2);
+  assert.equal(await page.evaluate(() => window.playerSeekFixture.playCalls), 2, "Close must not obtain a new playback source");
+  return { playback_requests: 2, recovered_from_api_failure: true, close_preserves_buffer: true, buffered_replay_without_network: true };
 }
 
 async function lifecyclePlayerCheck(page, legacy) {

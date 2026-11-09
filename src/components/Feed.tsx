@@ -56,6 +56,7 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
   const [rate, setRate] = useState(1);
   const [waiting, setWaiting] = useState(false);
   const [err, setErr] = useState("");
+  const dismissedPlaybackError = useRef(false);
   const [panel, setPanel] = useState<"episodes" | "comments" | "article" | "detail" | null>(null);
   const [descOpen, setDescOpen] = useState(false);
   /* 续播：拿到时长后再 seek 一次（只对进入时那一条生效） */
@@ -239,6 +240,7 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
   useEffect(() => {
     if (!curId || kind !== "video") return;
     let alive = true;
+    dismissedPlaybackError.current = false;
     setErr("");
     setWaiting(true);
     setPlayUrls({});
@@ -260,6 +262,7 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
 
   /* 切换条目/集数时重置播放状态 */
   useEffect(() => {
+    dismissedPlaybackError.current = false;
     setTime(0); setDuration(0); setBuffered(0); setErr(""); setWaiting(true); setPaused(false); setDescOpen(false);
     setVsize({ w: 0, h: 0 });
   }, [playKey]);
@@ -560,7 +563,7 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
                   onPause={() => setPaused(true)}
                   onWaiting={() => setWaiting(true)}
                   onEnded={() => { const next = episodes.find((e) => e.ep_num === curEp + 1); if (next) pickEp(next.ep_num); }}
-                  onError={(m) => setErr(m)} />
+                  onError={(m) => { if (!dismissedPlaybackError.current) setErr(m); }} />
                 </div>
               ) : (
                 <div className="absolute inset-0">
@@ -756,10 +759,15 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
                     <span>视频暂时无法加载</span>
                     <span className="text-[10.5px] hg-ink-4 max-w-[240px] text-center break-all">{err}</span>
                     <button className="hg-link text-[12.5px]" onClick={() => {
+                      dismissedPlaybackError.current = false;
                       setErr(""); setWaiting(true);
                       if (kind === "video") setPlayAttempt((attempt) => attempt + 1);
                       else videoRef.current?.play();
                     }}>重试</button>
+                    <button className="hg-link text-[12.5px]" onClick={() => {
+                      dismissedPlaybackError.current = true;
+                      setErr(""); setWaiting(false);
+                    }}>关闭</button>
                   </div>
                 </div>
               )}

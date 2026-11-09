@@ -41,6 +41,8 @@ const PLAYBACK_CONTEXT_MAX: usize = 64;
 const PLAYBACK_CONTEXT_TTL: Duration = Duration::from_secs(3600);
 const CONTEXT_BYTES: usize = 16;
 const CDN_APP_HEADER: &str = "x-cdn-app";
+const PRIVATE_SEGMENT_CACHE: &str = "private, max-age=3600";
+const MEDIA_SEGMENT_EXTENSIONS: &[&str] = &[".ts", ".m4s", ".mp4", ".aac", ".m4a"];
 
 #[derive(Default, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -469,8 +471,11 @@ fn segment_response_with_context(
                 200,
                 "application/vnd.apple.mpegurl",
                 rewrite_playlist_with_context(target, text, origin, context).into_bytes(),
-                // Rewriting nested URIs does not require disabling the upstream cache policy.
-                "public, max-age=3600",
+                if context.is_some() {
+                    "no-store"
+                } else {
+                    "public, max-age=3600"
+                },
             ),
             Err(_) => respond(
                 502,
@@ -480,11 +485,26 @@ fn segment_response_with_context(
             ),
         };
     }
+    let cache = if context.is_some() {
+        let media_segment = url::Url::parse(target).is_ok_and(|url| {
+            let path = url.path().to_ascii_lowercase();
+            MEDIA_SEGMENT_EXTENSIONS
+                .iter()
+                .any(|extension| path.ends_with(extension))
+        });
+        if media_segment && bytes.len() != 16 {
+            PRIVATE_SEGMENT_CACHE
+        } else {
+            "no-store"
+        }
+    } else {
+        "public, max-age=3600"
+    };
     respond(
         200,
         ctype.unwrap_or("application/octet-stream"),
         bytes,
-        "public, max-age=3600",
+        cache,
     )
 }
 
@@ -539,7 +559,7 @@ pub async fn handle(path: &str, query: &str, origin: &str) -> Response<Vec<u8>> 
         "proxy.begin",
         serde_json::json!({"route": route, "resource": crate::playback_log::resource_id(&target)}),
     );
-    let mut response = match path {
+    let response = match path {
         "/img" => match load_image(&target).await {
             Ok((kind, bytes)) => {
                 respond(200, &kind, bytes.as_ref().clone(), "public, max-age=86400")
@@ -566,11 +586,6 @@ pub async fn handle(path: &str, query: &str, origin: &str) -> Response<Vec<u8>> 
         },
         _ => respond(404, "text/plain", b"not found".to_vec(), "no-store"),
     };
-    if context_key.is_some() {
-        response
-            .headers_mut()
-            .insert("Cache-Control", HeaderValue::from_static("no-store"));
-    }
     crate::playback_log::record(
         "proxy.end",
         serde_json::json!({"route": route, "resource": crate::playback_log::resource_id(&target), "status": response.status().as_u16(), "bytes": response.body().len(), "elapsed_ms": started.elapsed().as_millis() as u64}),
@@ -581,6 +596,48 @@ pub async fn handle(path: &str, query: &str, origin: &str) -> Response<Vec<u8>> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn authenticated_video_segments_are_cacheable_but_keys_and_playlists_are_not() {
+        let segment = segment_response_with_context(
+            "https://cdn.example/part.ts?auth_key=value",
+            Some("video/mp2t"),
+            vec![0x47; 188],
+            LOCAL_ORIGIN,
+            Some("playback-context"),
+        );
+        assert_eq!(segment.headers()["Cache-Control"], "private, max-age=3600");
+        for target in [
+            "https://cdn.example/key.key",
+            "https://cdn.example/key.bin",
+            "https://cdn.example/key.ts",
+        ] {
+            let key = segment_response_with_context(
+                target,
+                None,
+                vec![1; 16],
+                LOCAL_ORIGIN,
+                Some("playback-context"),
+            );
+            assert_eq!(key.headers()["Cache-Control"], "no-store");
+        }
+        let nested = segment_response_with_context(
+            "https://cdn.example/child.m3u8",
+            None,
+            b"#EXTM3U\npart.ts\n".to_vec(),
+            LOCAL_ORIGIN,
+            Some("playback-context"),
+        );
+        assert_eq!(nested.headers()["Cache-Control"], "no-store");
+        assert!(String::from_utf8_lossy(nested.body()).contains("&p=playback-context"));
+        let legacy = segment_response(
+            "https://cdn.example/part.ts",
+            None,
+            vec![0x47; 188],
+            LOCAL_ORIGIN,
+        );
+        assert_eq!(legacy.headers()["Cache-Control"], "public, max-age=3600");
+    }
 
     #[test]
     fn playback_context_keeps_credentials_private_and_scopes_them_to_cdn_origin() {

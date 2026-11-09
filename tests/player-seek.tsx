@@ -28,6 +28,11 @@ const fixture = {
   flushLogs: flushPlaybackLog,
   rejectLoggingSave: false,
   playCalls: 0,
+  failPlayback: () => testHls?.trigger(Hls.Events.ERROR, {
+    type: Hls.ErrorTypes.NETWORK_ERROR, details: Hls.ErrorDetails.FRAG_LOAD_ERROR,
+    fatal: true, error: new Error("Media network unavailable"),
+    frag: testHls.levels[0]?.details?.fragments[0],
+  }),
   pauseBuffering: () => testHls?.pauseBuffering(),
   resumeBuffering: () => testHls?.resumeBuffering(),
   engineState: () => ({ loading: testHls?.loadingEnabled, buffering: testHls?.bufferingEnabled, levels: testHls?.levels.length }),
