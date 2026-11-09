@@ -9,8 +9,12 @@ use aes::cipher::{BlockDecrypt, KeyInit};
 use aes::Aes128;
 use once_cell::sync::Lazy;
 use percent_encoding::{percent_decode_str, utf8_percent_encode, NON_ALPHANUMERIC};
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+use ring::rand::{SecureRandom, SystemRandom};
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tauri::http::{Response, StatusCode};
 
 /// 本平台自定义协议的完整基址。
@@ -33,6 +37,142 @@ static PL_CACHE: Lazy<Mutex<HashMap<String, Arc<String>>>> =
 
 const IMG_CACHE_MAX: usize = 240;
 const PL_CACHE_MAX: usize = 60;
+const PLAYBACK_CONTEXT_MAX: usize = 64;
+const PLAYBACK_CONTEXT_TTL: Duration = Duration::from_secs(3600);
+const CONTEXT_BYTES: usize = 16;
+const CDN_APP_HEADER: &str = "x-cdn-app";
+
+#[derive(Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct CdnAuth {
+    m3u8_enabled: bool,
+    other_enabled: bool,
+    auth_key: String,
+    auth_value: String,
+    app: String,
+}
+
+struct PlaybackContext {
+    manifest: url::Url,
+    referer: String,
+    headers: HeaderMap,
+    playlist_auth: bool,
+    segment_auth: bool,
+    created: Instant,
+}
+
+static PLAYBACK_CONTEXTS: Lazy<Mutex<HashMap<String, Arc<PlaybackContext>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+impl PlaybackContext {
+    fn headers_for(&self, target: &str) -> Option<HeaderMap> {
+        let target = url::Url::parse(target).ok()?;
+        if target.origin() != self.manifest.origin() {
+            return None;
+        }
+        let path = target.path().to_ascii_lowercase();
+        let playlist = path.ends_with(".m3u8");
+        let segment = [".ts", ".m4s", ".key"]
+            .iter()
+            .any(|ext| path.ends_with(ext));
+        ((playlist && self.playlist_auth) || (segment && self.segment_auth))
+            .then(|| self.headers.clone())
+    }
+}
+
+/// 前端只得到带随机上下文编号的代理地址，CDN 头和播放凭据不进入 URL/日志/磁盘。
+pub fn register_playback(origin: &str, payload: &serde_json::Value) -> Result<String, String> {
+    if payload["manifest_method"] != "GET" {
+        return Err("播放清单请求方式不受支持".into());
+    }
+    let raw = payload["streams"]["main"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .ok_or("播放接口未返回可用的视频地址")?;
+    let manifest = crate::network_policy::parse_target(raw)?;
+    if manifest.scheme() != "https" {
+        return Err("播放地址必须使用 HTTPS".into());
+    }
+    let auth: CdnAuth = serde_json::from_value(
+        payload
+            .get("cdn")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({})),
+    )
+    .map_err(|_| "媒体鉴权配置格式无效")?;
+    let mut headers = HeaderMap::new();
+    if auth.m3u8_enabled || auth.other_enabled {
+        let name =
+            HeaderName::from_bytes(auth.auth_key.as_bytes()).map_err(|_| "媒体鉴权头无效")?;
+        // 服务端配置只能提供专用 X-* 头，不能覆盖 Cookie、Host、Authorization 等通用凭据。
+        if !name.as_str().starts_with("x-")
+            || name == CDN_APP_HEADER
+            || auth.auth_value.is_empty()
+            || auth.auth_value.len() > 1024
+            || auth.app.is_empty()
+            || auth.app.len() > 64
+        {
+            return Err("媒体鉴权配置无效".into());
+        }
+        headers.insert(
+            name,
+            HeaderValue::from_str(&auth.auth_value).map_err(|_| "媒体鉴权值无效")?,
+        );
+        headers.insert(
+            CDN_APP_HEADER,
+            HeaderValue::from_str(&auth.app).map_err(|_| "媒体应用标识无效")?,
+        );
+    }
+    let context = Arc::new(PlaybackContext {
+        manifest,
+        referer: format!("{origin}/"),
+        headers,
+        playlist_auth: auth.m3u8_enabled,
+        segment_auth: auth.other_enabled,
+        created: Instant::now(),
+    });
+    let mut bytes = [0u8; CONTEXT_BYTES];
+    SystemRandom::new()
+        .fill(&mut bytes)
+        .map_err(|_| "无法建立媒体播放上下文")?;
+    let key = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    let mut contexts = PLAYBACK_CONTEXTS
+        .lock()
+        .map_err(|_| "媒体播放上下文锁失败")?;
+    contexts.retain(|_, value| value.created.elapsed() < PLAYBACK_CONTEXT_TTL);
+    if contexts.len() >= PLAYBACK_CONTEXT_MAX {
+        if let Some(oldest) = contexts
+            .iter()
+            .min_by_key(|(_, value)| value.created)
+            .map(|(key, _)| key.clone())
+        {
+            contexts.remove(&oldest);
+        }
+    }
+    contexts.insert(key.clone(), context);
+    Ok(format!("{LOCAL_ORIGIN}/hls?p={key}"))
+}
+
+async fn fetch_for_context(
+    url: &str,
+    context: Option<&PlaybackContext>,
+) -> Result<(Option<String>, Vec<u8>), String> {
+    match context {
+        Some(context) => {
+            crate::net::fetch_media_bytes(url, &context.referer, context.headers_for(url)).await
+        }
+        None => fetch_bytes(url).await,
+    }
+}
+
+pub fn clear_playback_contexts() {
+    if let Ok(mut contexts) = PLAYBACK_CONTEXTS.lock() {
+        contexts.clear();
+    }
+    if let Ok(mut playlists) = PL_CACHE.lock() {
+        playlists.clear();
+    }
+}
 
 fn cache_put<V: Clone>(map: &Mutex<HashMap<String, V>>, key: String, val: V, max: usize) {
     let mut m = map.lock().unwrap();
@@ -180,26 +320,55 @@ fn map_uri_attributes(line: &str, mut rewrite: impl FnMut(&str) -> String) -> St
     format!("{tag}:{}", mapped.join(","))
 }
 
+#[cfg(test)]
 fn rewrite_uri_attr(line: &str, prefix: &str) -> String {
-    map_uri_attributes(line, |uri| format!("{prefix}/seg?u={}", enc(uri)))
+    rewrite_uri_attr_with_context(line, prefix, None)
+}
+
+fn proxy_segment(prefix: &str, target: &str, context: Option<&str>) -> String {
+    let mut url = format!("{prefix}/seg?u={}", enc(target));
+    if let Some(key) = context {
+        url.push_str(&format!("&p={key}"));
+    }
+    url
+}
+
+fn rewrite_uri_attr_with_context(line: &str, prefix: &str, context: Option<&str>) -> String {
+    map_uri_attributes(line, |uri| proxy_segment(prefix, uri, context))
 }
 
 /// 取 m3u8 并把 key / 分片地址改写到本地协议。
-pub async fn load_playlist(url: &str, prefix: &str) -> Result<Arc<String>, String> {
-    if let Some(hit) = PL_CACHE.lock().unwrap().get(url).cloned() {
+async fn load_playlist_with_context(
+    url: &str,
+    prefix: &str,
+    key: Option<&str>,
+    context: Option<&PlaybackContext>,
+) -> Result<Arc<String>, String> {
+    let cache_key = format!("{prefix}:{}:{url}", key.unwrap_or_default());
+    if let Some(hit) = PL_CACHE.lock().unwrap().get(&cache_key).cloned() {
         return Ok(hit);
     }
-    let (_, bytes) = fetch_bytes(url).await?;
+    let (_, bytes) = fetch_for_context(url, context).await?;
     let text = std::str::from_utf8(&bytes).map_err(|_| "播放列表不是 UTF-8 文本")?;
     if !text.trim_start_matches('\u{feff}').starts_with("#EXTM3U") {
         return Err("响应不是 HLS 播放列表".into());
     }
-    let arc = Arc::new(rewrite_playlist(url, text, prefix));
-    cache_put(&PL_CACHE, url.to_string(), arc.clone(), PL_CACHE_MAX);
+    let arc = Arc::new(rewrite_playlist_with_context(url, text, prefix, key));
+    cache_put(&PL_CACHE, cache_key, arc.clone(), PL_CACHE_MAX);
     Ok(arc)
 }
 
+#[cfg(test)]
 fn rewrite_playlist(url: &str, text: &str, prefix: &str) -> String {
+    rewrite_playlist_with_context(url, text, prefix, None)
+}
+
+fn rewrite_playlist_with_context(
+    url: &str,
+    text: &str,
+    prefix: &str,
+    context: Option<&str>,
+) -> String {
     let mut out = String::with_capacity(text.len() + 512);
     for raw in text.trim_start_matches('\u{feff}').lines() {
         let line = raw.trim_end();
@@ -233,13 +402,13 @@ fn rewrite_playlist(url: &str, text: &str, prefix: &str) -> String {
             if line.contains("URI=\"") {
                 // KEY/MAP/MEDIA/SESSION-KEY/PART/PRELOAD-HINT 等 URI 都必须经过目标检查。
                 let absolute = absolutize_uri_in_attr(url, line);
-                out.push_str(&rewrite_uri_attr(&absolute, prefix));
+                out.push_str(&rewrite_uri_attr_with_context(&absolute, prefix, context));
             } else {
                 out.push_str(line);
             }
         } else {
             let absolute = absolutize(url, line);
-            out.push_str(&format!("{prefix}/seg?u={}", enc(&absolute)));
+            out.push_str(&proxy_segment(prefix, &absolute, context));
         }
         out.push('\n');
     }
@@ -274,11 +443,22 @@ fn respond(status: u16, ctype: &str, body: Vec<u8>, cache: &str) -> Response<Vec
 }
 
 /// 主清单的子清单也经 /seg 返回：必须继续改写，不能把内层 URL 原样交给播放器。
+#[cfg(test)]
 fn segment_response(
     target: &str,
     ctype: Option<&str>,
     bytes: Vec<u8>,
     origin: &str,
+) -> Response<Vec<u8>> {
+    segment_response_with_context(target, ctype, bytes, origin, None)
+}
+
+fn segment_response_with_context(
+    target: &str,
+    ctype: Option<&str>,
+    bytes: Vec<u8>,
+    origin: &str,
+    context: Option<&str>,
 ) -> Response<Vec<u8>> {
     let playlist = ctype.is_some_and(|t| t.to_ascii_lowercase().contains("mpegurl"))
         || bytes.starts_with(b"#EXTM3U")
@@ -288,7 +468,7 @@ fn segment_response(
             Ok(text) => respond(
                 200,
                 "application/vnd.apple.mpegurl",
-                rewrite_playlist(target, text, origin).into_bytes(),
+                rewrite_playlist_with_context(target, text, origin, context).into_bytes(),
                 // Rewriting nested URIs does not require disabling the upstream cache policy.
                 "public, max-age=3600",
             ),
@@ -313,10 +493,35 @@ fn segment_response(
 /// `origin` 是本平台自定义协议的完整基址，见 [`LOCAL_ORIGIN`]；用于改写 m3u8 里的
 /// 分片与 key 地址。正常情况下调用方直接传 [`LOCAL_ORIGIN`]。
 pub async fn handle(path: &str, query: &str, origin: &str) -> Response<Vec<u8>> {
+    let context_key = query.split('&').find_map(|kv| kv.strip_prefix("p="));
+    let context = if let Some(key) = context_key {
+        let context = PLAYBACK_CONTEXTS
+            .lock()
+            .ok()
+            .and_then(|contexts| contexts.get(key).cloned())
+            .filter(|context| context.created.elapsed() < PLAYBACK_CONTEXT_TTL);
+        if context.is_none() {
+            return respond(
+                410,
+                "text/plain",
+                "播放信息已失效，请重新获取".as_bytes().to_vec(),
+                "no-store",
+            );
+        }
+        context
+    } else {
+        None
+    };
     let target = query
         .split('&')
         .find_map(|kv| kv.strip_prefix("u="))
         .map(dec)
+        .or_else(|| {
+            context
+                .as_ref()
+                .filter(|_| path == "/hls")
+                .map(|c| c.manifest.to_string())
+        })
         .unwrap_or_default();
 
     if target.is_empty() {
@@ -334,28 +539,38 @@ pub async fn handle(path: &str, query: &str, origin: &str) -> Response<Vec<u8>> 
         "proxy.begin",
         serde_json::json!({"route": route, "resource": crate::playback_log::resource_id(&target)}),
     );
-    let response = match path {
+    let mut response = match path {
         "/img" => match load_image(&target).await {
             Ok((kind, bytes)) => {
                 respond(200, &kind, bytes.as_ref().clone(), "public, max-age=86400")
             }
             Err(e) => respond(502, "text/plain", e.into_bytes(), "no-store"),
         },
-        "/hls" => match load_playlist(&target, origin).await {
-            Ok(text) => respond(
-                200,
-                "application/vnd.apple.mpegurl",
-                text.as_bytes().to_vec(),
-                "no-store",
-            ),
-            Err(e) => respond(502, "text/plain", e.into_bytes(), "no-store"),
-        },
-        "/seg" => match fetch_bytes(&target).await {
-            Ok((ctype, bytes)) => segment_response(&target, ctype.as_deref(), bytes, origin),
+        "/hls" => {
+            match load_playlist_with_context(&target, origin, context_key, context.as_deref()).await
+            {
+                Ok(text) => respond(
+                    200,
+                    "application/vnd.apple.mpegurl",
+                    text.as_bytes().to_vec(),
+                    "no-store",
+                ),
+                Err(e) => respond(502, "text/plain", e.into_bytes(), "no-store"),
+            }
+        }
+        "/seg" => match fetch_for_context(&target, context.as_deref()).await {
+            Ok((ctype, bytes)) => {
+                segment_response_with_context(&target, ctype.as_deref(), bytes, origin, context_key)
+            }
             Err(e) => respond(502, "text/plain", e.into_bytes(), "no-store"),
         },
         _ => respond(404, "text/plain", b"not found".to_vec(), "no-store"),
     };
+    if context_key.is_some() {
+        response
+            .headers_mut()
+            .insert("Cache-Control", HeaderValue::from_static("no-store"));
+    }
     crate::playback_log::record(
         "proxy.end",
         serde_json::json!({"route": route, "resource": crate::playback_log::resource_id(&target), "status": response.status().as_u16(), "bytes": response.body().len(), "elapsed_ms": started.elapsed().as_millis() as u64}),
@@ -366,6 +581,49 @@ pub async fn handle(path: &str, query: &str, origin: &str) -> Response<Vec<u8>> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn playback_context_keeps_credentials_private_and_scopes_them_to_cdn_origin() {
+        let payload = serde_json::json!({"manifest_method":"GET", "streams":{"main":"https://cdn.example/list.m3u8"},
+            "cdn":{"m3u8Enabled":true,"otherEnabled":true,"authKey":"x-media-auth","authValue":"private-value","app":"player"}});
+        let source = register_playback("https://site.example", &payload).unwrap();
+        assert!(!source.contains("private-value") && !source.contains("cdn.example"));
+        let key = source.split("?p=").nth(1).unwrap();
+        let context = PLAYBACK_CONTEXTS.lock().unwrap().get(key).unwrap().clone();
+        assert_eq!(
+            context.headers_for("https://cdn.example/key.key").unwrap()["x-media-auth"],
+            "private-value"
+        );
+        assert!(context
+            .headers_for("https://other.example/key.key")
+            .is_none());
+        assert!(context
+            .headers_for("http://cdn.example/segment.ts")
+            .is_none());
+        assert!(context
+            .headers_for("https://cdn.example/image.jpg")
+            .is_none());
+        let body = rewrite_playlist_with_context(
+            "https://cdn.example/list.m3u8",
+            "#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"key.key\"\nchild.m3u8\n",
+            LOCAL_ORIGIN,
+            Some(key),
+        );
+        assert_eq!(body.matches(&format!("&p={key}")).count(), 2);
+        assert!(!body.contains("private-value"));
+        let mut invalid = payload.clone();
+        invalid["cdn"]["authKey"] = serde_json::json!("Authorization");
+        assert!(register_playback("https://site.example", &invalid).is_err());
+        invalid["cdn"]["authKey"] = serde_json::json!("x-media-auth");
+        invalid["cdn"]["authValue"] = serde_json::json!("value\r\nCookie: secret");
+        assert!(register_playback("https://site.example", &invalid).is_err());
+    }
+
+    #[tokio::test]
+    async fn unknown_playback_context_fails_without_fetching_upstream() {
+        let response = handle("/hls", "p=missing-session", LOCAL_ORIGIN).await;
+        assert_eq!(response.status(), 410);
+    }
 
     #[test]
     fn dateranges_keep_timing_and_scte_metadata_but_drop_external_resources() {
@@ -424,46 +682,44 @@ mod tests {
     }
 
     /// 联网测试：默认跳过，手动跑 `cargo test --lib -- --ignored`。
-    /// 依赖上游 `/api/videos/117/play` 返回的实时播放地址。
+    /// 依赖上游当前播放服务；仅请求一份清单、一个密钥和一个分片，不保存内容。
     #[tokio::test]
     #[ignore = "联网测试：依赖上游实时播放地址，手动用 --ignored 运行"]
     async fn live_play_chain() {
-        use crate::net::edge;
-        let play = edge(
-            &crate::net::base(),
-            "GET",
-            "/api/videos/117/play?ep=3&page_texts=0",
-            None,
-            None,
-        )
-        .await
-        .expect("play api");
-        let url = play["video_url"].as_str().expect("video_url").to_string();
-        println!("play url: {}", &url[..url.len().min(90)]);
-        let (_, bytes) = fetch_bytes(&url).await.expect("fetch playlist");
-        let text = String::from_utf8_lossy(&bytes);
-        println!(
-            "raw playlist len={} head={}",
-            text.len(),
-            &text[..text.len().min(160)]
-        );
-        let q = format!("u={}", enc(&url));
-        let resp = handle("/hls", &q, LOCAL_ORIGIN).await;
+        let payload = crate::playback::prepare(&crate::net::base(), None, 12, 1)
+            .await
+            .expect("playback prepare");
+        let source = register_playback(&crate::net::base(), &payload).expect("register playback");
+        let q = source.split('?').nth(1).unwrap();
+        let resp = handle("/hls", q, LOCAL_ORIGIN).await;
+        assert_eq!(resp.status(), 200, "playlist fetch failed");
         let body = String::from_utf8_lossy(resp.body()).to_string();
-        println!("proxied status={} len={}", resp.status(), body.len());
         assert!(body.contains("#EXTM3U"));
+        if let Some(key) = body
+            .lines()
+            .find(|line| line.starts_with("#EXT-X-KEY:"))
+            .and_then(|line| line.split("URI=\"").nth(1))
+            .and_then(|value| value.split('"').next())
+        {
+            let key = url::Url::parse(key).unwrap();
+            let response = handle(key.path(), key.query().unwrap(), LOCAL_ORIGIN).await;
+            assert_eq!(response.status(), 200, "key fetch failed");
+            assert_eq!(response.body().len(), 16, "invalid AES-128 key");
+        }
         // 取一个分片验证
         let seg_line = body
             .lines()
             .find(|l| !l.starts_with('#') && l.contains("/seg?u="))
             .expect("seg line")
             .to_string();
-        println!("seg line: {}", &seg_line[..seg_line.len().min(120)]);
-        let seg_q = seg_line.split("?u=").nth(1).unwrap();
-        let seg = handle("/seg", &format!("u={seg_q}"), LOCAL_ORIGIN).await;
-        println!("segment status={} len={}", seg.status(), seg.body().len());
+        let seg_url = url::Url::parse(&seg_line).unwrap();
+        let seg = handle(seg_url.path(), seg_url.query().unwrap(), LOCAL_ORIGIN).await;
         assert_eq!(seg.status(), 200);
         assert!(seg.body().len() > 1000);
+        println!(
+            "playback handshake, playlist, key and first segment succeeded ({} bytes)",
+            seg.body().len()
+        );
     }
 
     /// 离线回归：不再依赖带 auth_key 时效的真实上游地址（旧地址已过期，会 403）。
@@ -481,7 +737,9 @@ mod tests {
         );
         // 分片必须绝对化到源站，并保留签名查询串。
         assert!(
-            body.contains("https%3A%2F%2Fcdn%2Eexample%2Fvideos5%2Fabc%2Fseg%2D1%2Ets%3Fauth%5Fkey%3D"),
+            body.contains(
+                "https%3A%2F%2Fcdn%2Eexample%2Fvideos5%2Fabc%2Fseg%2D1%2Ets%3Fauth%5Fkey%3D"
+            ),
             "segment not absolutized with query: {body}"
         );
         // 加密 KEY 也要走本地代理，否则 hls.js 会直接打源站被 CORS 拦住。

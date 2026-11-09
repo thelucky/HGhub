@@ -27,6 +27,7 @@ const fixture = {
   setLogging: setPlaybackLog,
   flushLogs: flushPlaybackLog,
   rejectLoggingSave: false,
+  playCalls: 0,
   pauseBuffering: () => testHls?.pauseBuffering(),
   resumeBuffering: () => testHls?.resumeBuffering(),
   engineState: () => ({ loading: testHls?.loadingEnabled, buffering: testHls?.bufferingEnabled, levels: testHls?.levels.length }),
@@ -61,7 +62,13 @@ document.addEventListener("seeking", (e) => {
 }, true);
 window.addEventListener("error", (e) => fixture.errors.push(e.message));
 api.boot = async () => ({ user: null, logged_in: false, base: "https://fixture.invalid", strict_security: true });
-api.play = async () => ({ id: 991, ep_num: 1, title: "Seek fixture", duration: 90, video_url: "https://media.fixture.invalid/list.m3u8" });
+api.play = async () => {
+  fixture.playCalls++;
+  if (new URLSearchParams(location.search).has("retry") && fixture.playCalls === 1) {
+    throw new Error("HTTP 404：播放请求失败");
+  }
+  return { id: 991, ep_num: 1, title: "Seek fixture", duration: 90, video_url: "https://media.fixture.invalid/list.m3u8" };
+};
 api.video = async () => ({
   id: 991, title: "Seek fixture", description: "", cover: "", tags: [], score: 0,
   episode_count: 1, total_episodes: 1,

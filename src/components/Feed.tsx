@@ -43,6 +43,7 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
   const [epMap, setEpMap] = useState<Record<number, number>>(() => (startEp ? { [videoIds[startIndex]]: startEp } : {}));
   const [details, setDetails] = useState<Record<number, Detail>>({});
   const [playUrls, setPlayUrls] = useState<Record<string, string>>({});
+  const [playAttempt, setPlayAttempt] = useState(0);
   const [cards, setCards] = useState<Record<number, VideoCard>>({});
   const [posts, setPosts] = useState<Record<number, Post>>({});
 
@@ -236,9 +237,15 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
 
   /* 拉播放地址 */
   useEffect(() => {
-    if (!curId) return;
-    if (playUrls[playKey]) return;
+    if (!curId || kind !== "video") return;
     let alive = true;
+    setErr("");
+    setWaiting(true);
+    setPlayUrls({});
+    const saved = liveRef.current;
+    if (saved.id === curId && saved.ep === curEp && saved.t > 1) {
+      resumeRef.current = { key: playKey, t: saved.t };
+    }
     api.play(curId, curEp)
       .then((info) => {
         if (!alive) return;
@@ -249,7 +256,7 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
       .catch((e) => { if (alive) setErr((e as Error).message || "取播放地址失败"); });
     return () => { alive = false; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [curId, curEp]);
+  }, [curId, curEp, kind, playAttempt, user?.id]);
 
   /* 切换条目/集数时重置播放状态 */
   useEffect(() => {
@@ -748,7 +755,11 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
                   <div className="rounded-xl p-5 flex flex-col items-center gap-3 text-[13px] hg-ink-2" style={{ background: "rgba(0,0,0,.7)" }}>
                     <span>视频暂时无法加载</span>
                     <span className="text-[10.5px] hg-ink-4 max-w-[240px] text-center break-all">{err}</span>
-                    <button className="hg-link text-[12.5px]" onClick={() => { setErr(""); setWaiting(true); videoRef.current?.play(); }}>重试</button>
+                    <button className="hg-link text-[12.5px]" onClick={() => {
+                      setErr(""); setWaiting(true);
+                      if (kind === "video") setPlayAttempt((attempt) => attempt + 1);
+                      else videoRef.current?.play();
+                    }}>重试</button>
                   </div>
                 </div>
               )}

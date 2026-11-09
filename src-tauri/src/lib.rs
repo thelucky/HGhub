@@ -7,6 +7,7 @@ mod media;
 mod net;
 mod network_policy;
 mod playback_log;
+mod playback;
 mod session;
 
 use api::Api;

@@ -144,7 +144,7 @@ export async function selfTest(): Promise<string> {
   try {
     const info = await api.play(117, 3);
     steps.push(`play:${info?.video_url ? "ok" : "empty"}`);
-    const hlsUrl = `${LOCAL}/hls?u=${encodeURIComponent(info.video_url)}`;
+    const hlsUrl = isLocalMedia(info.video_url) ? info.video_url : playlist(info.video_url);
     const r1 = await fetch(hlsUrl);
     const txt = await r1.text();
     steps.push(`hls:${r1.status}/${txt.length}/${txt.startsWith("#EXTM3U") ? "m3u8" : "bad"}`);
@@ -155,7 +155,8 @@ export async function selfTest(): Promise<string> {
         const rustUrl = m[1];
         steps.push(`rustUrl:${rustUrl.slice(0, 60)}`);
         // A/B：用 JS 重新编码同一条上游地址
-        const inner = decodeURIComponent(rustUrl.split("?u=")[1] || "");
+        const keyProxy = new URL(rustUrl);
+        const inner = keyProxy.searchParams.get("u") || "";
         steps.push(`inner:${inner.slice(0, 50)}`);
         try {
           const rk = await fetch(rustUrl);
@@ -163,7 +164,11 @@ export async function selfTest(): Promise<string> {
           steps.push(`keyRust:${rk.status}/${bk.byteLength}`);
         } catch (e) { steps.push(`keyRust:throw:${(e as Error).message.slice(0, 30)}`); }
         try {
-          const rk2 = await fetch(`${LOCAL}/seg?u=${encodeURIComponent(inner)}`);
+          const keyUrl = new URL(`${LOCAL}/seg`);
+          keyUrl.searchParams.set("u", inner);
+          const context = keyProxy.searchParams.get("p");
+          if (context) keyUrl.searchParams.set("p", context);
+          const rk2 = await fetch(keyUrl);
           const bk2 = await rk2.arrayBuffer();
           steps.push(`keyJs:${rk2.status}/${bk2.byteLength}`);
         } catch (e) { steps.push(`keyJs:throw:${(e as Error).message.slice(0, 30)}`); }

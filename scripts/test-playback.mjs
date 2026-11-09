@@ -14,14 +14,14 @@ import { createServer as createViteServer } from "vite";
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const { values: args } = parseArgs({ options: {
   "media-dir": { type: "string" }, output: { type: "string" }, "browser-executable": { type: "string" },
-  scenarios: { type: "string", default: "seek,legacy,stall,lifecycle,mms" }, help: { type: "boolean" },
+  scenarios: { type: "string", default: "seek,legacy,stall,lifecycle,mms,retry" }, help: { type: "boolean" },
 } });
 if (args.help) {
-  console.log("pnpm test:playback [--media-dir DIR] [--output NEW_DIR] [--browser-executable PATH] [--scenarios seek,legacy,stall,lifecycle,mms]");
+  console.log("pnpm test:playback [--media-dir DIR] [--output NEW_DIR] [--browser-executable PATH] [--scenarios seek,legacy,stall,lifecycle,mms,retry]");
   process.exit(0);
 }
 const scenarios = args.scenarios.split(",");
-assert(scenarios.length && scenarios.every(s => ["seek", "legacy", "stall", "lifecycle", "mms"].includes(s)), "Unknown scenario");
+assert(scenarios.length && scenarios.every(s => ["seek", "legacy", "stall", "lifecycle", "mms", "retry"].includes(s)), "Unknown scenario");
 const output = resolve(args.output || join(root, "test-results", "playback", new Date().toISOString().replace(/[:.]/g, "-")));
 await mkdir(dirname(output), { recursive: true });
 await mkdir(output); // Refuse to overwrite artifacts from an earlier run.
@@ -220,6 +220,17 @@ async function managedMediaCheck(page) {
   }
   return { simulated_mms: true, players };
 }
+async function retryCheck(page) {
+  await page.goto(`${report.ui}/tests/player-seek.html?diagnostics=1&retry=1&proxy=${encodeURIComponent(report.media)}`);
+  await page.getByText("视频暂时无法加载", { exact: true }).waitFor();
+  assert.equal(await page.evaluate(() => window.playerSeekFixture.playCalls), 1);
+  await page.getByRole("button", { name: "重试", exact: true }).click();
+  await page.waitForFunction(() => document.querySelector("video")?.currentTime > 1);
+  assert.equal(await page.evaluate(() => window.playerSeekFixture.playCalls), 2, "Retry must obtain fresh playback information");
+  assert.equal(await page.getByText("视频暂时无法加载", { exact: true }).count(), 0);
+  return { playback_requests: 2, recovered_from_api_failure: true };
+}
+
 async function lifecyclePlayerCheck(page, legacy) {
   let release, held, holdDeadline;
   const gate = new Promise(done => { release = done; });
@@ -312,7 +323,7 @@ try {
     const result = { name, status: "running", started: new Date().toISOString() }; report.cases.push(result);
     let deadline;
     try {
-      const action = name === "seek" || name === "legacy" ? seekChecks(page, name === "legacy") : name === "stall" ? stallCheck(page) : name === "mms" ? managedMediaCheck(page) : lifecycleCheck(page);
+      const action = name === "seek" || name === "legacy" ? seekChecks(page, name === "legacy") : name === "stall" ? stallCheck(page) : name === "mms" ? managedMediaCheck(page) : name === "retry" ? retryCheck(page) : lifecycleCheck(page);
       result.metrics = await Promise.race([action, new Promise((_, reject) => { deadline = setTimeout(() => reject(new Error("Scenario exceeded 45 seconds")), 45000); })]);
       assert.deepEqual(pageErrors, [], "Browser script errors");
       assert.deepEqual(externalRequests, [], "Unexpected external network requests");

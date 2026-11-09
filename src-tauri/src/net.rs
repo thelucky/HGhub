@@ -1,7 +1,6 @@
 //! 网络层：与上游站点对话。
 //!
-//! 站点把全部 `/api/**` 调用收敛成 `POST /api/edge/request` 的信封，
-//! 我们只实现这一个入口，其余接口都是「填 path」。
+//! 列表等业务使用边缘信封；播放取址走独立加密通道（见 playback.rs）。
 //!
 //! # 代理（用户反馈「浏览器能开、HGhub 打不开」的根因就在这里）
 //!
@@ -148,6 +147,27 @@ fn build_client(host: &str, addrs: &[SocketAddr]) -> Result<reqwest::Client, Str
         .map_err(|_| "无法创建 HTTP 客户端".to_string())
 }
 
+/// 加密播放通道仅允许当前 HTTPS 线路；POST 不跟随重定向，也不自动重放。
+pub(crate) async fn playback_post(origin: &str, body: &Value) -> Result<Value, String> {
+    let origin = normalize_base(origin).ok_or("播放线路地址无效")?;
+    let (target, client) = client_for(&format!("{origin}/api/playback/request")).await?;
+    let response = client
+        .post(target)
+        .header("Accept", "application/json")
+        .header("Referer", format!("{origin}/"))
+        .json(body)
+        .send()
+        .await
+        .map_err(|e| err_text(&e))?;
+    if !response.status().is_success() {
+        return Err(format!("HTTP {}：播放请求失败", response.status()));
+    }
+    response
+        .json()
+        .await
+        .map_err(|_| "播放接口响应格式无效".into())
+}
+
 const CLIENT_TTL: Duration = Duration::from_secs(30);
 type ClientCache = HashMap<String, (Instant, Arc<reqwest::Client>)>;
 static CLIENTS: Lazy<Mutex<ClientCache>> = Lazy::new(|| Mutex::new(HashMap::new()));
@@ -206,17 +226,34 @@ pub async fn get(
     accept: Option<&str>,
     referer: Option<&str>,
 ) -> Result<reqwest::Response, String> {
+    get_with_headers(raw, timeout, accept, referer, None).await
+}
+
+/// 媒体鉴权头仅发送给起始 origin；跨站重定向不得携带这些凭据。
+pub async fn get_with_headers(
+    raw: &str,
+    timeout: Duration,
+    accept: Option<&str>,
+    referer: Option<&str>,
+    headers: Option<&reqwest::header::HeaderMap>,
+) -> Result<reqwest::Response, String> {
     tokio::time::timeout(timeout, async {
         let policy_error = |phase: &str, error: String| {
             crate::playback_log::record("network.target_failed", json!({"resource": crate::playback_log::resource_id(raw), "phase": phase, "error_kind": crate::playback_log::error_kind(&error)}));
             error
         };
         let mut next = network_policy::parse_target(raw).map_err(|e| policy_error("parse", e))?;
+        let credential_origin = next.origin();
         for hop in 0..=5 {
             let resolving = Instant::now();
             let (target, http) = client_for(next.as_str()).await.map_err(|e| policy_error("dns_or_client", e))?;
             crate::playback_log::record("network.target_ready", json!({"resource": crate::playback_log::resource_id(raw), "target_resource": crate::playback_log::resource_id(target.as_str()), "dns_or_client_ms": resolving.elapsed().as_millis() as u64, "hop": hop}));
             let mut request = http.get(target.clone()).timeout(timeout);
+            if target.origin() == credential_origin {
+                if let Some(headers) = headers {
+                    request = request.headers(headers.clone());
+                }
+            }
             if let Some(value) = accept {
                 request = request.header("Accept", value);
             }
@@ -613,25 +650,34 @@ pub async fn edge(
 
 /// 拉原始字节（图片 / m3u8 / 分片）。
 pub async fn fetch_bytes(url: &str) -> Result<(Option<String>, Vec<u8>), String> {
+    fetch_media_bytes(url, &format!("{}/", base()), None).await
+}
+
+pub async fn fetch_media_bytes(
+    url: &str,
+    referer: &str,
+    headers: Option<reqwest::header::HeaderMap>,
+) -> Result<(Option<String>, Vec<u8>), String> {
     static NEXT_REQUEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let request = NEXT_REQUEST.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let resource = crate::playback_log::resource_id(url);
     let mut attempt = 0;
     let url = url.to_string();
-    let referer = format!("{}/", base());
+    let referer = referer.to_string();
     with_retry(true, || {
         attempt += 1;
         let attempt = attempt;
         let resource = resource.clone();
         let url = url.clone();
         let referer = referer.clone();
+        let headers = headers.clone();
         async move {
             let started = Instant::now();
             crate::playback_log::record("network.begin", json!({"request": request, "resource": resource, "attempt": attempt}));
             let mut status = None;
             let mut headers_ms = None;
             let result = async {
-                let resp = get(&url, Duration::from_secs(20), None, Some(&referer)).await?;
+                let resp = get_with_headers(&url, Duration::from_secs(20), None, Some(&referer), headers.as_ref()).await?;
                 status = Some(resp.status().as_u16());
                 headers_ms = Some(started.elapsed().as_millis() as u64);
                 if !resp.status().is_success() {

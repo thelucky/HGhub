@@ -119,9 +119,9 @@ xcrun devicectl device install app --device <UDID> <解压后的 Payload/HGhub.a
 
 Mihomo 与 sing-box 分流规则、已知域名统计及导入方法，见 [网络分流规则](rules/README.md)。
 
-1. **统一边缘信封**：站点把 `/api/**` 收敛为 `POST /api/edge/request`（`method/path/body(base64)/content_type` + `Authorization: Bearer`），本项目只对接这一个入口，无需处理 Cookie。
+1. **业务与播放请求**：列表等业务继续使用边缘信封；视频取址适配网站当前的独立加密播放通道，以 P-256 / HKDF / AES-GCM 建立短会话，按集 POST 获取播放源与 CDN 配置。实现与验证边界见 [播放请求适配](docs/playback-request.md)。
 2. **封面解密**：封面为 AES-128-CBC 密文，Rust 侧解密后经自定义协议输出，前端 `<img>` 直接使用。
-3. **HLS 代理**：m3u8 与分片经自定义协议转发并改写 `#EXT-X-KEY` / 分片地址，绕开 WebView 的 CORS 与防盗链。
+3. **HLS 代理**：m3u8 与分片经自定义协议转发并改写 `#EXT-X-KEY` / 分片地址；按上游配置附加媒体鉴权头。凭据只保存在 Rust 内存中，跨站请求不转发鉴权头。
 4. **自定义协议**：Windows / Android 为 `http://hg.localhost/*`，macOS 为 `hg://localhost/*`（Tauri 的平台差异）。
    Rust 侧 `lib.rs` 与前端 `api.ts` 各自按平台生成一次基址，两处必须一致，否则封面与视频全部加载失败。
 5. **不做签名逆向**：只复用浏览器同源行为，接口字段均有文档与实测样本。

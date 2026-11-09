@@ -65,6 +65,7 @@ pub async fn line_set(state: State<'_, Api>, url: String) -> Result<String, Stri
     let previous = base();
     let next = crate::net::set_base(&url)?;
     if previous != next {
+        crate::media::clear_playback_contexts();
         state.session.clear();
     }
     Ok(next)
@@ -220,6 +221,7 @@ pub async fn api_login(
     if base() != origin {
         return Err("登录期间线路已变化，请重新登录".into());
     }
+    crate::media::clear_playback_contexts();
     state.session.set(&origin, token, user.clone());
     Ok(json!({ "user": user }))
 }
@@ -257,6 +259,7 @@ pub async fn api_register(
     if base() != origin {
         return Err("注册期间线路已变化，请重新登录".into());
     }
+    crate::media::clear_playback_contexts();
     state.session.set(&origin, token, user.clone());
     Ok(json!({ "user": user }))
 }
@@ -274,6 +277,7 @@ pub async fn api_logout(state: State<'_, Api>) -> Result<Value, String> {
     )
     .await;
     state.session.clear();
+    crate::media::clear_playback_contexts();
     Ok(json!({ "ok": true }))
 }
 
@@ -357,9 +361,26 @@ pub async fn api_video(state: State<'_, Api>, id: i64) -> Result<Value, String> 
 
 #[tauri::command]
 pub async fn api_play(state: State<'_, Api>, id: i64, ep: u32) -> Result<Value, String> {
-    state
-        .get(&format!("/api/videos/{id}/play?ep={ep}&page_texts=0"))
-        .await
+    let origin = base();
+    let token = state.session.token(&origin);
+    let started = std::time::Instant::now();
+    let result = async {
+        let payload = crate::playback::prepare(&origin, token.as_deref(), id, ep).await?;
+        if base() != origin || state.session.token(&origin) != token {
+            return Err("线路或登录状态已变化，请重试".to_string());
+        }
+        let source = crate::media::register_playback(&origin, &payload)?;
+        Ok(json!({ "id": id, "ep_num": ep, "video_url": source }))
+    }
+    .await;
+    crate::playback_log::record(
+        "playback.prepare",
+        json!({
+            "ok": result.is_ok(), "elapsed_ms": started.elapsed().as_millis() as u64,
+            "error_kind": result.as_ref().err().map(|e| crate::playback_log::error_kind(e))
+        }),
+    );
+    result
 }
 
 /* ───────────────────────── 评论 / 互动 ───────────────────────── */
