@@ -88,6 +88,10 @@ macOS 先装 Xcode Command Line Tools（`xcode-select --install`），打包目�
 
 Android（需 Android SDK + NDK，并配置 `ANDROID_HOME` / `NDK_HOME`）：
 
+本 fork 的 Android 版名称保持 **HGhub**，包名为 `com.thelucky.hghub`，由
+`src-tauri/tauri.android.conf.json` 单独配置。可与官方版（`com.hghub.huangguo`）同时安装，
+本地登录状态、收藏和观看记录分别保存。更新此版本时需保持包名和签名一致；不要卸载官方版。
+
 ```bash
 pnpm android:init     # 首次生成 android 工程
 pnpm android:dev      # 真机 / 模拟器调试
